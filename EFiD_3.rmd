@@ -1,0 +1,949 @@
+---
+title: "<center>Ekonometria Finansowa i Dynamiczna - projekt III</center>"
+output: 
+    html_document:
+          toc: true
+          toc_float: true
+          number_sections: true
+          css: style.css
+---
+<center>
+Karol Doliński, Magdalena Kurek, Magdalena Smalarz, Małgorzata Warczyńska
+
+Informatyka i Ekonometria
+</center>
+
+
+
+```{r setup, include=FALSE}
+options(scipen=999)
+knitr::opts_chunk$set(
+ fig.width = 6,
+ fig.asp = 0.9,
+ out.width = "100%"
+)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(aTSA)
+library(fGarch)
+library(forecast)
+library(ggplot2)
+library(plotly)
+library(rugarch)
+library(tseries)
+library(urca)
+library(lmtest)
+library(table1)
+library(kableExtra)
+library(ggpubr)
+library(tseries)
+library(vars)
+library(zoo)
+library(reshape)
+library(tsDyn)
+```
+
+# Wprowadzenie
+
+Celem pracy jest zbadanie zależności zachodzących pomiędzy wybranymi kursami walutowymi wykorzystując model VAR, a następnie dokonanie prognozy przy pomocy modelu VECM na najbliższe sesje oraz ocena jakości tych prognoz. Przyjęty poziom istotności: $\alpha=5\%$.
+
+Wykorzystane w pracy dane zostały pobrane w dniu 01.05.2022 roku ze strony [Stooq](https://stooq.pl/) i dotyczą okresu od 1 stycznia 2018 roku do 31 marca 2022 roku. Zbiór danych dotyczy wartości zamknięcia dla indeksów (w ujęciu dziennym):
+
+1. EUR-ISK: kurs euro - korona islandzka,
+2. EUR-EGP: kurs euro - funt egipski,
+3. EUR-SEK: kurs euro - korona szwedzka.
+ 
+
+-----
+
+# Przygotowanie danych
+
+Pierwszym etapem przygotowania danych było rozwiązanie problemu braków danych dla poszczególnych indeksów spowodowanych np. świętami narodowymi w danym państwie. Do rozwiązania tego problemu posłużono się interpolacją liniową. Liniowa funkcja interpolująca $L(x)$w przedziale $[x_0, x_1]$ ma postać: 
+
+$$L(x)=y_0 + \frac{y_1-y_0}{x_1-x_0}(x-x_0),$$
+gdzie: $y_0, y_1$ to w niniejszej pracy odpowiednio wartości zamknięcia dla danego indeksu z dnia $x_0$ i $x_1$. Występuje zależność: $x_0<x<x_1$, gdzie $x$ to dzień, dla którego nie ma wartości indeksu. 
+
+<br>
+
+Następnie wyznaczono dzienne stopy zwrotu (logarytmiczne). Stopa zwrotu jest wskaźnikiem finansowym, miarą ryzyka danego przedsięwzięcia czy inwestycji. Logarytmiczna stopa zwrotu ma postać: 
+
+$$R_{t} = ln(\frac{P_t}{P_{t-1}})$$
+
+$R_{t}$ - logarytmiczna stopa zwrotu  
+$P_{t}$ - wartość zamknięcia indeksu w czasie t  
+$P_{t-1}$ - wartość zamknięcia indeksu w czasie t-1 
+
+```{r warning=FALSE, include=FALSE}
+kurs1 <- read.csv('eursek_d.csv')
+kurs1 <- cbind.data.frame(kurs1$Data, kurs1$Zamkniecie)
+colnames(kurs1) <- c('Date', 'Closing')
+
+kurs2 <- read.csv('eurisk_d.csv')
+kurs2 <- cbind.data.frame(kurs2$Data, kurs2$Zamkniecie)
+colnames(kurs2) <- c('Date', 'Closing')
+
+kurs3 <- read.csv('euregp_d.csv')
+kurs3 <- cbind.data.frame(kurs3$Data, kurs3$Zamkniecie)
+colnames(kurs3) <- c('Date', 'Closing')
+
+#Zlaczenie danych
+dane <- merge(kurs1, kurs2, by="Date", incomparables = NA, all.x = T, all.y = T)
+dane <- merge(dane, kurs3, by="Date", incomparables = NA, all.x = T, all.y = T)
+colnames(dane) <- c('Date', 'SEK', 'ISK', 'EGP')
+
+#Zastapienie brakujacych danych (interpolacja)
+for (i in 2:4)
+{
+  dane[,i] <- na.approx(dane[,i], rule=2)
+}
+sum(is.na(dane)) #Sprawdzenie czy nie ma brakow danych
+
+#Stopy logarytmiczne
+stopy <- data.frame()
+for(i in 2:nrow(dane)) {
+  stopy[i-1,1] <- dane[i,1]
+  stopy[i-1,2] <- log(dane[i,2]/dane[i-1,2])
+  stopy[i-1,3] <- log(dane[i,3]/dane[i-1,3])
+  stopy[i-1,4] <- log(dane[i,4]/dane[i-1,4])
+}
+colnames(stopy) <- colnames(dane)
+```
+
+Ważnym etapem jest zbadanie stacjonarności zmiennych. Jeżeli szereg czasowy nie jest stacjonarny, to większość testów nie ma właściwych rozkładów. Stacjonarność szeregu zweryfikowano testem ADF (<i>ang.</i> Augmented Dickey–Fuller test). Hipotezy mają następującą postać:
+
+<center>$H_0:$ Szereg jest niestacjonarny</center>
+
+<center>$H_1:$ Szereg jest stacjonarny</center>
+
+```{r echo=FALSE, warning=FALSE}
+#Stacjonarnosc
+ADF_pvalue <- as.data.frame(matrix(NA,1,3))
+colnames(ADF_pvalue) <- c('SEK', 'ISK', 'EGP')
+rownames(ADF_pvalue) <- c('P-value')
+ADF_pvalue[1,] <- 0.01
+
+ADF_pvalue %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 1.: P-value dla testu ADF",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+```
+
+P-value dla każdego z wykonanych testów ADF jest mniejsze niż przyjęty poziom istotności 0.05, dlatego istnieją podstawy do odrzucenia hipotezy zerowej. Szeregi są stacjonarne. 
+
+
+# Model VAR
+
+Model wektorowo-autoregresyjny VAR można zapisać jako:
+$$y_t = c + A_1 y_{t-1} + A_2 y_{t-2} + ... + A_p y_{t-p} + \epsilon_t$$
+gdzie:
+
+$y_t$ - wektor zmiennych (indeksów),
+
+$A_i$ - macierz parametrów dla zmiennych opóźnionych, $i=1,2,...p$, gdzie $p$ to liczba opóźnień.
+
+
+Ważnym etapem poprzedzającym estymację modelu VAR, jest wybór liczby opóźnień $p$. Kryteria wyboru liczby opóźnień to:
+
+1. AIC (ang. Akaike Information Criterion)
+2. SBC (ang. Schwarz Bayesian Criterion)
+3. Hannana-Quinna
+
+Wybranym rzędem opóźnień, jest rząd, dla którego wartości kryteriów są jak najmniejsze. 
+
+```{r echo=FALSE, warning=FALSE}
+#Wybor opoznienia
+VSelect <- VARselect(stopy[,2:4], 5)
+
+VSelect$criteria[1:3,] %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 2.: Kryteria informacyjne",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+Wartości kryteriów dla poszczególnych opóźnień są do siebie bardzo zbliżone. Natomiast wszystkie wskazują, iż najlepsze opóźnienie to opóźnienie $p=1$, dlatego zdecydowano się przyjąć właśnie je.
+
+Kolejnym krokiem jest budowa i analiza modelu VAR(1). 
+
+```{r echo=FALSE, warning=FALSE}
+#Model VAR
+model <- VAR(stopy[2:4], p=1)
+summary(model)
+```
+
+W celu zbadania istotności poszczególnych zmiennych w równaniach modelu wykorzystano test t-Studenta, który bada wpływ zmiennej objaśniającej na zmienną objaśnianą. Hipotezy:
+
+<center>$H_0:$ $\alpha_j = 0$ (zmienna nieistotna)</center>
+
+<center>$H_1:$ $\alpha_j \neq 0$  (zmienna istotna)</center>
+
+Na podstawie testów istotności statystycznej oszacowanych parametrów można stwierdzić, iż:
+
+- w modelu $$SEK_t = SEK_{t-1} + ISK_{t-1} + EGP_{t-1} +c$$ istotna jest zmienna $SEK_{t-1}$ 
+
+- w modelu $$ISK_t = SEK_{t-1} + ISK_{t-1} + EGP_{t-1} +c$$ istotna jest zmienna $ISK_{t-1}$ 
+
+- w modelu $$EGP_t = SEK_{t-1} + ISK_{t-1} + EGP_{t-1} +c$$ istotne są zmienne $SEK_{t-1}$ $EGP_{t-1}$ 
+
+Można zaobserwować, że każdy kurs zależy od swojej wartości z poprzedniej sesji.
+
+
+Po wyestymowaniu modelu, należy jeszcze poddać weryfikacji czy w równaniach nie zachodzi autokorelacja. Do weryfikacji autokorelacji reszt poszczególnych równań posłużono się testem Ljunga-Boxa. Badane rzędy $k$ autokorelacji: 1-25. Zestaw hipotez testu:
+
+<center>$H_0: \rho_1 = \rho_2 = ... = \rho_k = 0$</center>
+
+<center> $H_1:  \rho_i \neq 0$ dla pewnego $i$  </center>
+
+```{r echo=FALSE, warning=FALSE}
+#Autokorelacja składnika losowego
+Box_result <- as.data.frame(matrix(NA,25,3))
+colnames(Box_result) <- c('SEK', 'ISK', 'EGP')
+for(i in 1:25){
+  Box_result[i,1] <- Box.test(model$varresult$SEK$residuals, i, type = "Ljung-Box")$p.value
+  Box_result[i,2] <- Box.test(model$varresult$ISK$residuals, i, type = "Ljung-Box")$p.value
+  Box_result[i,3] <- Box.test(model$varresult$EGP$residuals, i, type = "Ljung-Box")$p.value
+}
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=6, fig.asp=0.618, out.width="50%", fig.show="hold"}
+Box_result_ISK <- data.frame(cbind(1:25, Box_result$ISK))
+colnames(Box_result_ISK) <- c('Lag', 'pvalue')
+
+gg_ISK <- ggplot(Box_result_ISK, aes(x=Lag, y=pvalue)) +
+  geom_point() +
+  ylim(c(0, 1)) + 
+  xlim(c(1, 25)) + 
+  labs(y="P-value",
+       x="Opóźnienie",
+       title="Test Ljung-Box'a: EUR-ISK") +
+  theme_bw()
+
+plot(gg_ISK)
+
+Box_result_EGP <- data.frame(cbind(1:25, Box_result$EGP))
+colnames(Box_result_EGP) <- c('Lag', 'pvalue')
+
+gg_EGP <- ggplot(Box_result_EGP, aes(x=Lag, y=pvalue)) +
+  geom_point() +
+  ylim(c(0, 1)) + 
+  xlim(c(1, 25)) + 
+  labs(y="P-value",
+       x="Opóźnienie",
+       title="Test Ljung-Box'a: EUR-EGP") +
+  theme_bw()
+
+plot(gg_EGP)
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=6, fig.asp=0.618, out.width="50%", fig.show="hold", fig.align="center"}
+Box_result_SEK <- data.frame(cbind(1:25, Box_result$SEK))
+colnames(Box_result_SEK) <- c('Lag', 'pvalue')
+
+gg_SEK <- ggplot(Box_result_SEK, aes(x=Lag, y=pvalue)) +
+  geom_point() +
+  ylim(c(0, 1)) + 
+  xlim(c(1, 25)) + 
+  labs(y="P-value",
+       x="Opóźnienie",
+       title="Test Ljung-Box'a: EUR-SEK") +
+  theme_bw()
+
+plot(gg_SEK)
+```
+
+Dla każdego równania modelu VAR(1) i badanego rzędu opóźnienia, p-value testu wyraźnie przekracza przyjęty poziom istotności, co oznacza, że nie ma podstaw do odrzucenia hipotezy zerowej. Zweryfikowano zatem, że autokorelacja reszt nie występuje w badanym modelu.
+
+Weryfikacji podlega także jednorodność wariancji reszt modelu, czyli zbadanie występowania homoskedastyczności. Składnik losowy o zmiennej wariancji świadczy o występowaniu efektu ARCH. Do sprawdzenia zmienności reszt modelu użyto testu Portmanteau-Q i testu mnożników Lagrange'a o hipotezach:
+
+<center>$H_0:$ Brak efektu ARCH</center>
+
+<center>$H_1:$ Efekt ARCH</center>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# --- ARCH ---
+#arch.test(model)
+```
+
+Oba testy wskazały p-value bliskie 0, co oznacza, iż istnieją podstawy do odrzucenia hipotezy zerowej i efekt ARCH występuje. Zmienność wariancji może powodować problemy podczas modelowania szeregów czasowych dlatego należy wykorzystać model GARCH.
+
+# Model GARCH
+
+Wykorzystując model GARCH(1,1) dla analizowanego modelu VAR(1) można wyestymować trzy równania opisujące warunkową wariancję składnika losowego. Wzór ogólny:
+
+$$\sigma^2_t=\omega+\alpha\varepsilon^2_{t-1}+\beta\sigma^2_{t-1}$$
+
+Estymując warunkową wariancję rozważono trzy różne rozkłady warunkowe: rozkład normalny, skośny rozkład normalny i skośny rozkład t-Studenta.
+
+## EUR-ISK {.tabset .tabset-fade}
+
+### Rozkład normalny
+
+ $$\sigma^2_t=0.2122\varepsilon^2_{t-1}+0.6285\sigma^2_{t-1}$$
+
+```{r, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE}
+# ------------ 4A ------------------
+# options: “norm”, “snorm”, “ged”, “sged”, “std”, “sstd”, “snig”, “QMLE”
+garch_norm_ISK <- garchFit(~garch(1,1), data = model$varresult$ISK$residuals, trace = FALSE, cond.dist = 'norm')
+# GARCH(1,1)
+coef <- round(garch_norm_ISK@fit$matcoef, 4)
+coef <- coef[2:4,-3]
+colnames(coef) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef) <- c( "$\\omega$", '$\\alpha$', '$\\beta$')
+
+coef %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 3.: Wartości wyestymowanych parametrów wraz z oceną ich istotności dla kursu EUR-ISK (rozkład normalny)",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W równaniu współczynniki $\alpha$ i $\beta$ są statystycznie istotne, a współczynnik $\omega$ wynosi 0. Przeprowadzone testy Ljung-Boxa wykazały brak autokorelacji zestandaryzowanych reszt, efekt ARCH nie występuje, jednak reszty nie mają rozkładu normalnego. Modelu GARCH nie można uznać za poprawny.
+
+### Rozkład skośny normalny
+
+ $$\sigma^2_t=0.2130\varepsilon^2_{t-1}+0.6568\sigma^2_{t-1}$$
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+garch_snorm_ISK <- garchFit(~garch(1,1), data = model$varresult$ISK$residuals, trace = FALSE, cond.dist = 'snorm')
+coef1 <- round(garch_snorm_ISK@fit$matcoef, 4)
+coef1 <- coef1[2:4,-3]
+colnames(coef1) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef1) <- c( "$\\omega$", '$\\alpha$', '$\\beta$')
+
+coef1 %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 4.: Wartości wyestymowanych parametrów wraz z oceną ich istotności dla kursu EUR-ISK (skośny rozkład normalny)",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W otrzymanym równaniu współczynniki $\alpha$ i $\beta$ także są statystycznie istotne. Składnik losowy nie posiada zmiennej wariancji. Przeprowadzone testy Ljung-Boxa wykazały brak autokorelacji zestandaryzowanych reszt, ale test zgodności Kołmogorowa nie pokazał zgodności zestandaryzowanych reszt z rozważanym rozkładem skośnym normalnym. Model GARCH nie jest poprawny.
+
+### Rozkład skośny t-Studenta
+
+ $$\sigma^2_t=0.5268\varepsilon^2_{t-1}+0.6865\sigma^2_{t-1}$$
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+garch_sstd_ISK <- garchFit(~garch(1,1), data = model$varresult$ISK$residuals, trace = FALSE, cond.dist = 'sstd')
+coef <- round(garch_sstd_ISK@fit$matcoef, 4)
+coef <- coef[2:4,-3]
+colnames(coef) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef) <- c( "$\\omega$", '$\\alpha$', '$\\beta$')
+
+coef %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 5.: Wartości wyestymowanych parametrów wraz z oceną ich istotności dla kursu EUR-ISK (skośny rozkład t-Studenta)",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W równaniu współczynniki $\alpha$ i $\beta$ są statystycznie istotne oraz nie występuje autokorelacja. Nie wykryto również efektu ARCH. Weryfikacja rozkładu zestandaryzowanych reszt przebiegła pomyślnie, ponieważ test zgodności Kołmogorowa wykazał zgodność zestandaryzowanych reszt ze skośnym rozkładem t-Studenta. Model GARCH można uznać za poprawny dla równania kursu euro-korona islandzka (ISK).
+
+## {.unlisted .unnumbered}
+
+## EUR-EGP {.tabset .tabset-fade}
+
+### Rozkład normalny
+
+ $$\sigma^2_t=0.0738\varepsilon^2_{t-1}+0.9411\sigma^2_{t-1}$$
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+garch_norm_EGP <- garchFit(~garch(1,1), data = model$varresult$EGP$residuals, trace = FALSE, cond.dist = 'norm')
+# GARCH(1,1)
+coef <- round(garch_norm_EGP@fit$matcoef, 4)
+coef <- coef[2:4,-3]
+colnames(coef) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef) <- c( "$\\omega$", '$\\alpha$', '$\\beta$')
+
+coef %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 6.: Wartości wyestymowanych parametrów wraz z oceną ich istotności dla kursu EUR-EGP (rozkład normalny)",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W równaniu współczynniki $\alpha$ i $\beta$ są statystycznie istotne oraz występuje autokorelacja. Nie wykryto heteroskedastyczności (efektu ARCH). Weryfikacja rozkładu zestandaryzowanych reszt nie przebiegła pomyślnie. Modelu GARCH nie można uznać za poprawny.
+
+### Rozkład skośny normalny
+
+ $$\sigma^2_t=0.0656\varepsilon^2_{t-1}+0.9422\sigma^2_{t-1}$$
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+garch_snorm_EGP <- garchFit(~garch(1,1), data = model$varresult$EGP$residuals, trace = FALSE, cond.dist = 'snorm')
+coef <- round(garch_snorm_EGP@fit$matcoef, 4)
+coef <- coef[2:4,-3]
+colnames(coef) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef) <- c( "$\\omega$", '$\\alpha$', '$\\beta$')
+
+coef %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 7.: Wartości wyestymowanych parametrów wraz z oceną ich istotności dla kursu EUR-EGP (skośny rozkład normalny)",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W równaniu współczynniki $\alpha$ i $\beta$ są statystycznie istotne natomiast test Ljung-Boxa wskazał, że występuje autokorelacja. Modelu GARCH nie można zatem uznać za poprawny.
+
+### Rozkład skośny t-Studenta
+
+ $$\sigma^2_t=0.0347\varepsilon^2_{t-1}+0.9589\sigma^2_{t-1}$$
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+garch_sstd_EGP <- garchFit(~garch(1,1), data = model$varresult$EGP$residuals, trace = FALSE, cond.dist = 'sstd')
+coef <- round(garch_sstd_EGP@fit$matcoef, 4)
+coef <- coef[2:4,-3]
+colnames(coef) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef) <- c( "$\\omega$", '$\\alpha$', '$\\beta$')
+
+coef %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 8.: Wartości wyestymowanych parametrów wraz z oceną ich istotności dla kursu EUR-EGP (skośny rozkład t-Studenta)",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W równaniu współczynniki $\alpha$ i $\beta$ są statystycznie istotne oraz nie występuje autokorelacja. Zmienność wariancji składnika losowego nie występuje. Weryfikacja rozkładu zestandaryzowanych reszt przebiegła pomyślnie, ponieważ test zgodności Kołmogorowa wykazał zgodność zestandaryzowanych reszt ze skośnym rozkładem t-Studenta. Model GARCH można uznać za poprawny dla równania kursu euro-funt egipski (EGP).
+
+## {.unlisted .unnumbered}
+
+
+## EUR-SEK {.tabset .tabset-fade}
+
+### Rozkład normalny
+
+ $$\sigma^2_t=0.0585\varepsilon^2_{t-1}+0.9183\sigma^2_{t-1}$$
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------ 4A ------------------
+# options: “norm”, “snorm”, “ged”, “sged”, “std”, “sstd”, “snig”, “QMLE”
+garch_norm_SEK <- garchFit(~garch(1,1), data = model$varresult$SEK$residuals, trace = FALSE, cond.dist = 'norm')
+# GARCH(1,1)
+coef <- round(garch_norm_SEK@fit$matcoef, 4)
+coef <- coef[2:4,-3]
+colnames(coef) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef) <- c( "$\\omega$", '$\\alpha$', '$\\beta$')
+
+coef %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 9.: Wartości wyestymowanych parametrów wraz z oceną ich istotności dla kursu EUR-SEK (rozkład normalny)",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W równaniu współczynniki $\alpha$ i $\beta$ są statystycznie istotne, a współczynnik $\omega$ wynosi 0. Przeprowadzone testy Ljung-Boxa wykazały brak autokorelacji zestandaryzowanych reszt, efekt ARCH nie występuje, ale reszty nie mają rozkładu normalnego. Modelu GARCH nie można uznać za poprawny.
+
+### Rozkład skośny normalny
+
+ $$\sigma^2_t=0.0573\varepsilon^2_{t-1}+0.9227\sigma^2_{t-1}$$
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------ 4A ------------------
+# options: “norm”, “snorm”, “ged”, “sged”, “std”, “sstd”, “snig”, “QMLE”
+garch_snorm_SEK <- garchFit(~garch(1,1), data = model$varresult$SEK$residuals, trace = FALSE, cond.dist = 'snorm')
+# GARCH(1,1)
+coef <- round(garch_snorm_SEK@fit$matcoef, 4)
+coef <- coef[2:4,-3]
+colnames(coef) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef) <- c( "$\\omega$", '$\\alpha$', '$\\beta$')
+
+coef %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 10.: Wartości wyestymowanych parametrów wraz z oceną ich istotności dla kursu EUR-SEK (skośny rozkład normalny)",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W równaniu współczynniki $\alpha$ i $\beta$ są statystycznie istotne oraz test Ljung-Boxa wskazał, że nie występuje autokorelacja. Nie występuje zmienność wariancji składnika losowego. Test zgodności Kołmogorowa wykazał zgodność zestandaryzowanych reszt z rozważanym rozkładem skośnym normalnym. Model GARCH można zatem uznać za poprawny i ten model wybrano do dalszej analizy dla indeksu euro-korona szwedzka (SEK).
+
+### Rozkład skośny t-Studenta
+
+ $$\sigma^2_t=0.0454\varepsilon^2_{t-1}+0.9354\sigma^2_{t-1}$$
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------ 4A ------------------
+# options: “norm”, “snorm”, “ged”, “sged”, “std”, “sstd”, “snig”, “QMLE”
+garch_sstd_SEK <- garchFit(~garch(1,1), data = model$varresult$SEK$residuals, trace = FALSE, cond.dist = 'sstd')
+# GARCH(1,1)
+coef <- round(garch_sstd_SEK@fit$matcoef, 4)
+coef <- coef[2:4,-3]
+colnames(coef) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef) <- c( "$\\omega$", '$\\alpha$', '$\\beta$')
+
+coef %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 11.: Wartości wyestymowanych parametrów wraz z oceną ich istotności dla kursu EUR-SEK (skośny rozkład t-Studenta)",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W równaniu współczynniki $\alpha$ i $\beta$ są statystycznie istotne oraz test Ljung-Boxa wskazał, że nie występuje autokorelacja. Mimo, że test zgodności Kołmogorowa wykazał zgodność zestandaryzowanych reszt ze skośnym rozkładem t-Studenta to w modelu występuje efekt ARCH. Modelu nie można uznać za poprawny.
+
+## {.unlisted .unnumbered}
+
+Wyestymowany model GARCH(1,1) dla analizowanego modelu VAR(1) ma postać:
+
+$$ISK:~~\sigma^2_t=0.5268\varepsilon^2_{t-1}+0.6865\sigma^2_{t-1}$$
+
+$$EGP:~~\sigma^2_t=0.0347\varepsilon^2_{t-1}+0.9589\sigma^2_{t-1}$$
+
+$$SEK:~~\sigma^2_t=0.0573\varepsilon^2_{t-1}+0.9227\sigma^2_{t-1}$$
+
+# Prognoza
+
+Do wyznaczenia prognoz logarytmów cen oraz cen wykorzystano model VECM.
+
+## Model VECM
+
+Przed estymacją modelu sprawdzono testem ADF czy logarytmy cen są niestacjonarnym szeregiem czasowym. 
+
+<center>$H_0:$ Szereg jest niestacjonarny</center>
+
+<center>$H_1:$ Szereg jest stacjonarny</center>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+log_prices <- log(dane[2:nrow(dane),2:4])
+
+ADF_pvalue_VECM <- as.data.frame(matrix(NA,1,3))
+ADF_pvalue_VECM  <- cbind(adf.test(log_prices$SEK)$p.value,adf.test(log_prices$ISK)$p.value,adf.test(log_prices$EGP)$p.value)
+colnames(ADF_pvalue_VECM ) <- c('SEK', 'ISK', 'EGP')
+rownames(ADF_pvalue_VECM ) <- c('P-value')
+
+ADF_pvalue_VECM  %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 12.: P-value dla testu ADF",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+Test wskazał p-value większe niż przyjęty poziom istotności 5%, co wskazuje na brak podstaw do odrzucenia hipotezy zerowej. Logarytmy cen są szeregiem niestacjonarnym, a więc istnieją podstawy do stworzenia modelu VECM.
+
+Tak jak w przypadku modelu VAR wybrano rząd opóźnień $p$. Kryteria informacyjne zgodnie wskazały rząd $p$=2, a więc do wyznaczenia prognoz będzie estymowany model VECM(1).
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#VARselect(log_prices, 5) #p=2, czyli VECM(1)
+```
+
+Następnie zbadano stopień kointegracji testem Johansena: śladu oraz największej wartości własnej. Zweryfikowanie kointegracji pozwala stwierdzić czy istnieje długookresowa relacja przyczynowo-skutkowa między zmiennymi modelu.
+
+Hipotezy testu:
+
+<center>$H_0:$ rank($\pi$) = r (brak wektorów kointegrujących)</center>
+
+<center>$H_1:$ r ≤ rank($\pi$) ≤ r+1 (istnieje przynajmniej 1 wektor kointegrujący)</center>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Model VECM
+test_johansena_slad<-summary(ca.jo(log_prices, type=c("trace"), K=2, ecdet="none"))
+johansen_slad<-cbind(test_johansena_slad@teststat, test_johansena_slad@cval)
+
+johansen_slad %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 13.: Wynik dla testu Johansena - ślad",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+test_johansena_wlasna<-summary(ca.jo(log_prices, type=c("eigen"), K=2, ecdet="none"))
+johansen_wlasna<-cbind(test_johansena_wlasna@teststat, test_johansena_wlasna@cval)
+
+johansen_wlasna %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 14.: Wynik dla testu Johansena - największa wartość własna",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+Dla r=0 statystyka testowa jest większa niż statystyka dla przyjętego poziomu istotności 5% przy obu testach. W tym przypadku hipoteza zostaje odrzucona. 
+
+W modelu VECM(1) zostanie wykorzystany jeden stopień kointegracji oraz rząd opóźnienia równy 1.
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+model_vecm <- VECM(log_prices, lag=1, r=1, estim = "ML")
+summary(model_vecm)
+```
+
+Po wyestymowaniu modelu sprawdzono założenia modelu VECM:
+
+1. Autokorelacja reszt
+
+2. Stacjonarność reszt
+
+W celu sprawdzenia autokorelacji wykorzystano test Ljung-Box'a. Badane rzędy $k$ autokorelacji: 1-25. Zestaw hipotez testu:
+
+<center>$H_0: \rho_1 = \rho_2 = ... = \rho_k = 0$</center>
+
+<center> $H_1:  \rho_i \neq 0$ dla pewnego $i$  </center>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+Box_result_VECM <- as.data.frame(matrix(NA,25,3))
+colnames(Box_result_VECM) <- c('SEK', 'ISK', 'EGP')
+for(i in 1:25){
+  Box_result_VECM[i,1] <- Box.test(model_vecm$residuals[,1], i, type = "Ljung-Box")$p.value
+  Box_result_VECM[i,2] <- Box.test(model_vecm$residuals[,2], i, type = "Ljung-Box")$p.value
+  Box_result_VECM[i,3] <- Box.test(model_vecm$residuals[,3], i, type = "Ljung-Box")$p.value
+}
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=6, fig.asp=0.618, out.width="50%", fig.show="hold"}
+Box_result_VECM_ISK <- data.frame(cbind(1:25, Box_result_VECM$ISK))
+colnames(Box_result_VECM_ISK) <- c('Lag', 'pvalue')
+
+gg_ISK_VECM <- ggplot(Box_result_VECM_ISK, aes(x=Lag, y=pvalue)) +
+  geom_point() +
+  ylim(c(0, 1)) + 
+  xlim(c(1, 25)) + 
+  labs(y="P-value",
+       x="Opóźnienie",
+       title="Test Ljung-Box'a VECM: EUR-ISK") +
+  theme_bw()
+
+plot(gg_ISK_VECM)
+
+Box_result_VECM_EGP <- data.frame(cbind(1:25, Box_result_VECM$EGP))
+colnames(Box_result_VECM_EGP) <- c('Lag', 'pvalue')
+
+gg_EGP_VECM <- ggplot(Box_result_VECM_EGP, aes(x=Lag, y=pvalue)) +
+  geom_point() +
+  ylim(c(0, 1)) + 
+  xlim(c(1, 25)) + 
+  labs(y="P-value",
+       x="Opóźnienie",
+       title="Test Ljung-Box'a VECM: EUR-ISK") +
+  theme_bw()
+
+plot(gg_EGP_VECM)
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=6, fig.asp=0.618, out.width="50%", fig.show="hold", fig.align="center"}
+Box_result_VECM_SEK <- data.frame(cbind(1:25, Box_result_VECM$SEK))
+colnames(Box_result_VECM_SEK) <- c('Lag', 'pvalue')
+
+gg_SEK_VECM <- ggplot(Box_result_VECM_SEK, aes(x=Lag, y=pvalue)) +
+  geom_point() +
+  ylim(c(0, 1)) + 
+  xlim(c(1, 25)) + 
+  labs(y="P-value",
+       x="Opóźnienie",
+       title="Test Ljung-Box'a VECM: EUR-SEK") +
+  theme_bw()
+
+plot(gg_SEK_VECM)
+```
+
+P-value testu wyraźnie przekracza przyjęty poziom istotności, co oznacza, że nie ma podstaw do odrzucenia hipotezy zerowej. Zweryfikowano zatem, że autokorelacja reszt nie występuje w badanym modelu.
+
+Ostatnim krokiem jest zbadanie stacjonarności testem Dickey'a-Fullera, o hipotezach:
+
+<center>$H_0:$ Szereg jest niestacjonarny</center>
+
+<center>$H_1:$ Szereg jest stacjonarny</center>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+urdf_value_VECM <- as.data.frame(matrix(NA,1,3))
+urdf_value_VECM  <- cbind(ur.df(model_vecm$residuals[,1])@teststat, ur.df(model_vecm$residuals[,2])@teststat, ur.df(model_vecm$residuals[,3])@teststat)
+colnames(urdf_value_VECM ) <- c('SEK', 'ISK', 'EGP')
+rownames(urdf_value_VECM ) <- c('Wartość statystyki')
+
+urdf_value_VECM  %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 15.: Statystyka testowa dla testu UR.DF",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+Dla każdego kursu walutowego statystyka testowa jest mniejsza niż wartość krytyczna -1.95. Istnieją podstawy do odrzucenia hipotezy zerowej co oznacza, że reszty modelu VECM są stacjonarne.
+
+Wyestymowany model VECM(1) można uznać za poprawny.
+
+
+## EUR-ISK {.tabset .tabset-fade}
+
+### Prognoza logarytmicznych stóp zwrotu
+
+Za pomocą modelu VAR(1) wyestymowanego na początku pracy dokonano prognozy 5 kolejnych logarytmicznych stóp zwrotu kursu ISK. Wyznaczone prognozy zestawiono wraz z wartościami 95%-owego przedziału ufności.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------ 5 -------------------
+# forecast: rates of return (logarithmic)
+forecast_RoR <- predict(model, n.ahead=5, level = 0.95)
+#summary(forecast_RoR)
+forecast_ROR_ISK<-data.frame(forecast_RoR$fcst$ISK)
+forecast_ROR_ISK<-forecast_ROR_ISK[,1:3]
+colnames(forecast_ROR_ISK) <- c('Wartość prognozy','Dolna granica przedziału ufności','Górna granica przedziału ufności')
+rownames(forecast_ROR_ISK) <- 1:5
+
+#forecast_ROR_ISK <- cbind(april_ISK$Data, forecast_ROR_ISK, forecast_GARCH_ISK[,4:5])
+#colnames(forecast_ROR_ISK) <- c('Data', 'Wartość prognozy','Dolna granica przedziału #ufności','Górna granica przedziału ufności', 'Dolna granica przedziału ufności (warunkowa #wariancja)','Górna granica przedziału ufności (warunkowa wariancja)')
+
+forecast_ROR_ISK %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 16.: Wartości prognoz logarytmicznych stóp zwrotu EUR-ISK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+### Prognoza logarytmów cen
+
+Następnie obliczono prognozy logarytmów cen wraz z wartościami 95%-owego przedziału ufności wykorzystując model VECM(1).
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# forecast: prices (logarithmic)
+# confidence interval: (mi - sd*1.96; mi + sd*1.96)
+april_ISK <- read.csv('eurisk_d_april.csv')
+forecast_log_prices <- predict(vec2var(ca.jo(log_prices, ecdet = 'none', type  = 'trace', K = 2, spec = 'transitory',  dumvar = NULL)), n.ahead=5, level = 0.95)
+forecast_log_prices_ISK <- data.frame(forecast_log_prices$fcst$ISK)
+forecast_log_prices_ISK<-forecast_log_prices_ISK[,1:3]
+forecast_log_prices_ISK <- cbind(april_ISK$Data, forecast_log_prices_ISK)
+colnames(forecast_log_prices_ISK) <- c('Data', 'Wartość prognozy','Dolna granica przedziału ufności','Górna granica przedziału ufności')
+rownames(forecast_log_prices_ISK) <- 1:5
+
+forecast_log_prices_ISK %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 17.: Wartości prognoz logarytmów cen kursu EUR-ISK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+### Prognoza cen
+
+Ostatnim etapem jest wyznaczenie prognoz cen na podstawie prognoz logarytmów cen obliczonych w poprzednim kroku. Logarytmy cen mają warunkowy rozkład normalny, więc ceny mają warunkowy rozkład log-normalny, którego wartość oczekiwana obliczana jest według wzoru:
+
+$$e^{\mu+\sigma^2/2}$$
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# forecast: prices while EX: e^mi+(sd^2/2)
+# Lo_95 = mi - sd*1.96 => sd = (mi - Lo_95) / 1.96
+sd <- (forecast_log_prices_ISK$`Wartość prognozy` - forecast_log_prices_ISK$`Dolna granica przedziału ufności`)/1.96
+forecast_prices_ISK <- cbind(round(exp(forecast_log_prices_ISK$`Wartość prognozy`+0.5*sd^2),4))
+forecast_prices_ISK  <- as.data.frame(forecast_prices_ISK )
+
+forecast_prices_ISK[,2:3] <- exp(forecast_log_prices_ISK[,3:4])
+forecast_prices_ISK <- cbind(april_ISK$Data, forecast_prices_ISK)
+
+colnames(forecast_prices_ISK) <- c('Data', 'Wartość prognozy', 'Dolna granica przedziału ufności','Górna granica przedziału ufności')
+rownames(forecast_prices_ISK) <- c('1','2','3','4','5')
+
+forecast_prices_ISK %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 18.: Wartości prognoz cen kursu EUR-ISK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+### Błędy prognozy
+
+W tabeli przedstawiono rzeczywiste wartości kursu euro-korona islandzka z pierwszych 5 sesji kwietnia 2022 w porównaniu z otrzymanymi prognozami cen.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+april <- cbind(april_ISK$Data, round(april_ISK$Zamkniecie,4), round(forecast_prices_ISK[,2],4))
+colnames(april) <- c('Data', 'Wartości rzeczywiste','Wartości prognozowane')
+april %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 19.: Porównanie wartości rzeczywistych i prognoz cen kursu walutowego EUR-ISK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W celu lepszego zobrazowania jakości prognoz wyznaczono podstawowe błędy prognozy ex-post.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ME <- round(mean((april_ISK$Zamkniecie-forecast_prices_ISK[,2])),5)
+MAE <- round(mean(abs(april_ISK$Zamkniecie-forecast_prices_ISK[,2])),5)
+MSE <- round(mean((april_ISK$Zamkniecie-forecast_prices_ISK[,2])^2),5)
+MAPE <- round(mean(abs((april_ISK$Zamkniecie-forecast_prices_ISK[,2])/april_ISK$Zamkniecie)),5)
+errors <- cbind(ME, MAE, MSE, MAPE)
+
+errors %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 20.: Błędy prognozy ex-post kursu EUR-ISK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+Przeciętne obciążenie prognozy wynosi -1.029 jednostek, a prognoza różni się od wartości rzeczywistej o średnio 1.029 jednostki. Różnica pomiędzy prognozami, a wartościami rzeczywistymi to średnio 0,7%. Uzyskane błędy są niskie, co świadczy o dobrej zdolności prognostycznej wystymowanego modelu. Prognozy kursu euro-korona islandzka można uznać za wiarygodne.
+
+## {.unlisted .unnumbered}
+
+## EUR-EGP {.tabset .tabset-fade}
+
+### Prognoza logarytmicznych stóp zwrotu
+
+Za pomocą modelu VAR(1) wyestymowanego na początku pracy dokonano prognozy 5 kolejnych logarytmicznych stóp zwrotu kursu EGP. Wyznaczone prognozy zestawiono wraz z wartościami 95%-owego przedziału ufności.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------ 5 -------------------
+# forecast: rates of return (logarithmic)
+#forecast_RoR <- predict(model, n.ahead=5, level = 0.95)
+#summary(forecast_RoR)
+forecast_ROR_EGP<-data.frame(forecast_RoR$fcst$EGP)
+forecast_ROR_EGP<-forecast_ROR_EGP[,1:3]
+colnames(forecast_ROR_EGP) <- c('Wartość prognozy','Dolna granica przedziału ufności','Górna granica przedziału ufności')
+rownames(forecast_ROR_EGP) <- 1:5
+
+forecast_ROR_EGP %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 21.: Wartości prognoz logarytmicznych stóp zwrotu EUR-EGP",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+### Prognoza logarytmów cen
+
+Następnie obliczono prognozy logarytmów cen wraz z wartościami 95%-owego przedziału ufności wykorzystując model VECM(1).
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# forecast: prices (logarithmic)
+# confidence interval: (mi - sd*1.96; mi + sd*1.96)
+april_EGP <- read.csv('euregp_d_april.csv')
+#forecast_log_prices <- predict(vec2var(ca.jo(log_prices, ecdet = 'none', type  = 'trace', K = 2, spec = 'transitory',  dumvar = NULL)), n.ahead=5, level = 0.95)
+forecast_log_prices_EGP <- data.frame(forecast_log_prices$fcst$EGP)
+forecast_log_prices_EGP <- forecast_log_prices_EGP[,1:3]
+forecast_log_prices_EGP <- cbind(april_EGP$Data, forecast_log_prices_EGP)
+colnames(forecast_log_prices_EGP) <- c('Data', 'Wartość prognozy','Dolna granica przedziału ufności','Górna granica przedziału ufności')
+rownames(forecast_log_prices_EGP) <- 1:5
+
+forecast_log_prices_EGP %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 22.: Wartości prognoz logarytmów cen kursu EUR-EGP",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+### Prognoza cen
+
+Ostatnim etapem jest wyznaczenie prognoz cen na podstawie prognoz logarytmów cen obliczonych w poprzednim kroku. Logarytmy cen mają warunkowy rozkład normalny, więc ceny mają warunkowy rozkład log-normalny, którego wartość oczekiwana obliczana jest według wzoru:
+
+$$e^{\mu+\sigma^2/2}$$
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# forecast: prices while EX: e^mi+(sd^2/2)
+# Lo_95 = mi - sd*1.96 => sd = (mi - Lo_95) / 1.96
+sd_EGP <- (forecast_log_prices_EGP$`Wartość prognozy` - forecast_log_prices_EGP$`Dolna granica przedziału ufności`)/1.96
+forecast_prices_EGP <- cbind(round(exp(forecast_log_prices_EGP$`Wartość prognozy`+0.5*sd_EGP^2),4))
+forecast_prices_EGP  <- as.data.frame(forecast_prices_EGP)
+
+forecast_prices_EGP[,2:3] <- exp(forecast_log_prices_EGP[,3:4])
+forecast_prices_EGP <- cbind(april_EGP$Data, forecast_prices_EGP)
+
+colnames(forecast_prices_EGP) <- c('Data', 'Wartość prognozy', 'Dolna granica przedziału ufności','Górna granica przedziału ufności')
+rownames(forecast_prices_EGP) <- c('1','2','3','4','5')
+
+forecast_prices_EGP %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 23.: Wartości prognoz cen kursu EUR-EGP",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+### Błędy prognozy
+
+W tabeli przedstawiono rzeczywiste wartości kursu euro-funt egipski z pierwszych 5 sesji kwietnia 2022 w porównaniu z otrzymanymi prognozami cen.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+april_EGP_bledy <- cbind(april_EGP$Data, round(april_EGP$Zamkniecie,4), round(forecast_prices_EGP[,2],4))
+colnames(april_EGP_bledy) <- c('Data', 'Wartości rzeczywiste','Wartości prognozowane')
+
+april_EGP_bledy %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 24.: Porównanie wartości rzeczywistych i prognoz cen kursu walutowego EUR-EGP",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W celu lepszego zobrazowania jakości prognoz wyznaczono podstawowe błędy prognozy ex-post.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ME <- round(mean((april_EGP$Zamkniecie-forecast_prices_EGP[,2])),5)
+MAE <- round(mean(abs(april_EGP$Zamkniecie-forecast_prices_EGP[,2])),5)
+MSE <- round(mean((april_EGP$Zamkniecie-forecast_prices_EGP[,2])^2),5)
+MAPE <- round(mean(abs((april_EGP$Zamkniecie-forecast_prices_EGP[,2])/april_EGP$Zamkniecie)),5)
+errors <- cbind(ME, MAE, MSE, MAPE)
+
+errors %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 25.: Błędy prognozy ex-post kursu EUR-EGP",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+Przeciętnie prognoza różni się od wartości rzeczywistej o średnio 0.179 jednostki. Różnica pomiędzy prognozami, a wartościami rzeczywistymi to średnio 0,8%. Uzyskane błędy są niskie, co świadczy o dobrej zdolności prognostycznej wystymowanego modelu. Prognozy kursu euro-funt egipski można uznać za wiarygodne.
+
+## {.unlisted .unnumbered}
+
+## EUR-SEK {.tabset .tabset-fade}
+
+### Prognoza logarytmicznych stóp zwrotu
+
+Za pomocą modelu VAR(1) wyestymowanego na początku pracy dokonano prognozy 5 kolejnych logarytmicznych stóp zwrotu kursu SEK. Wyznaczone prognozy zestawiono wraz z wartościami 95%-owego przedziału ufności.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------ 5 -------------------
+# forecast: rates of return (logarithmic)
+#forecast_RoR <- predict(model, n.ahead=5, level = 0.95)
+#summary(forecast_RoR)
+forecast_ROR_SEK<-data.frame(forecast_RoR$fcst$SEK)
+forecast_ROR_SEK<-forecast_ROR_SEK[,1:3]
+colnames(forecast_ROR_SEK) <- c('Wartość prognozy','Dolna granica przedziału ufności','Górna granica przedziału ufności')
+rownames(forecast_ROR_SEK) <- 1:5
+
+forecast_ROR_SEK %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 26.: Wartości prognoz logarytmicznych stóp zwrotu EUR-SEK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+### Prognoza logarytmów cen
+
+Następnie obliczono prognozy logarytmów cen wraz z wartościami 95%-owego przedziału ufności wykorzystując model VECM(1).
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# forecast: prices (logarithmic)
+# confidence interval: (mi - sd*1.96; mi + sd*1.96)
+april_SEK <- read.csv('eursek_d_april.csv')
+#forecast_log_prices <- predict(vec2var(ca.jo(log_prices, ecdet = 'none', type  = 'trace', K = 2, spec = 'transitory',  dumvar = NULL)), n.ahead=5, level = 0.95)
+forecast_log_prices_SEK <- data.frame(forecast_log_prices$fcst$SEK)
+forecast_log_prices_SEK <- forecast_log_prices_SEK[,1:3]
+forecast_log_prices_SEK <- cbind(april_SEK$Data, forecast_log_prices_SEK)
+colnames(forecast_log_prices_SEK) <- c('Data', 'Wartość prognozy','Dolna granica przedziału ufności','Górna granica przedziału ufności')
+rownames(forecast_log_prices_SEK) <- 1:5
+
+forecast_log_prices_SEK %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 27.: Wartości prognoz logarytmów cen kursu EUR-SEK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+### Prognoza cen
+
+Ostatnim etapem jest wyznaczenie prognoz cen na podstawie prognoz logarytmów cen obliczonych w poprzednim kroku. Logarytmy cen mają warunkowy rozkład normalny, więc ceny mają warunkowy rozkład log-normalny, którego wartość oczekiwana obliczana jest według wzoru:
+
+$$e^{\mu+\sigma^2/2}$$
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# forecast: prices while EX: e^mi+(sd^2/2)
+# Lo_95 = mi - sd*1.96 => sd = (mi - Lo_95) / 1.96
+sd_SEK <- (forecast_log_prices_SEK$`Wartość prognozy` - forecast_log_prices_SEK$`Dolna granica przedziału ufności`)/1.96
+forecast_prices_SEK <- cbind(round(exp(forecast_log_prices_SEK$`Wartość prognozy`+0.5*sd_SEK^2),4))
+forecast_prices_SEK  <- as.data.frame(forecast_prices_SEK)
+
+forecast_prices_SEK[,2:3] <- exp(forecast_log_prices_SEK[,3:4])
+forecast_prices_SEK <- cbind(april_SEK$Data, forecast_prices_SEK)
+
+colnames(forecast_prices_SEK) <- c('Data', 'Wartość prognozy', 'Dolna granica przedziału ufności','Górna granica przedziału ufności')
+rownames(forecast_prices_SEK) <- c('1','2','3','4','5')
+
+forecast_prices_SEK %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 28.: Wartości prognoz cen kursu EUR-SEK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+### Błędy prognozy
+
+W tabeli przedstawiono rzeczywiste wartości kursu euro-korona szwedzka z pierwszych 5 sesji kwietnia 2022 w porównaniu z otrzymanymi prognozami cen.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+april_SEK_bledy <- cbind(april_SEK$Data, round(april_SEK$Zamkniecie,4), round(forecast_prices_SEK[,2],4))
+colnames(april_SEK_bledy) <- c('Data', 'Wartości rzeczywiste','Wartości prognozowane')
+
+april_SEK_bledy %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 29.: Porównanie wartości rzeczywistych i prognoz cen kursu walutowego EUR-SEK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+W celu lepszego zobrazowania jakości prognoz wyznaczono podstawowe błędy prognozy ex-post.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ME <- round(mean((april_SEK$Zamkniecie-forecast_prices_SEK[,2])),5)
+MAE <- round(mean(abs(april_SEK$Zamkniecie-forecast_prices_SEK[,2])),5)
+MSE <- round(mean((april_SEK$Zamkniecie-forecast_prices_SEK[,2])^2),5)
+MAPE <- round(mean(abs((april_SEK$Zamkniecie-forecast_prices_SEK[,2])/april_SEK$Zamkniecie)),5)
+errors <- cbind(ME, MAE, MSE, MAPE)
+
+errors %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 30.: Błędy prognozy ex-post kursu EUR-SEK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+Przeciętnie prognoza różni się od wartości rzeczywistej o średnio 0.051 jednostki. Różnica pomiędzy prognozami, a wartościami rzeczywistymi to średnio 0,4%. Uzyskane błędy są niskie, co świadczy o dobrej zdolności prognostycznej wystymowanego modelu. W przypadku tego kursu walutowego otrzymano najniższe błędy prognoz ex-post. Prognozy kursu euro-korona szwedzka można uznać za wiarygodne.
+
+## {.unlisted .unnumbered}
+
+# Podsumowanie
+
+W pracy wykorzystano dzienne logarytmiczne stopy zwrotu kursów walutowych EUR-ISK, EUR-EGP i EUR-SEK. Po przygotowaniu danych i zbadaniu stacjonarności, dopasowano model wektorowo-autoregresyjny VAR(1). Opóźnienie rzędu 1 zostało wybrane na podstawie kryteriów informacyjnych Akkaike, Schwarza i Hannana-Quinna. Model tez przeszedł pozytywną weryfikację pod względem braku autokorelacji składników losowych, istotności parametrów przy najwyższych opóźnieniach, białoszumowości. Natomiast zidentyfikowano występowanie efektu ARCH, dlatego wyestymowano model GARCH(1,1). Następnie za pomocą wyestymowanego modelu VAR(1) dokonano prognozy logarytmicznych stóp zwrotu. Do prognoz logarytmów cen  na 5 sesji do przodu dla każdego z analizowanych kursów wykorzystano model VECM(1). Dodatkowo dla prognozowanych wartości zamieszczono 95% przedziały ufności. Na podstawie prognoz logarytmów cen wyznaczono prognozy cen biorąc pod uwagę fakt, że mają one warunkowy rozkład log-normalny. Prognozowane ceny porównano kolejno z wartościami rzeczywistymi dla pierwszych 5 sesji kwietnia 2022 i stwierdzono, że model VECM(1) dobrze zaprognozował przyszłe ceny kursów walutowych. Widać, że model VECM ma tendencję do niewielkiego zawyżania prognoz względem wartości rzeczywistych - dla wybranych w pracy szeregów czasowych.
